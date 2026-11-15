@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Mini Racer</title>
+<style>
+:root{--bg:#0f1720;--fg:#fff;--panel:rgba(0,0,0,.55);box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#0f1720;--fg:#fff}}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,sans-serif;overflow:hidden;touch-action:none}
+canvas{position:fixed;inset:0;display:block}
+.bar{position:fixed;left:8px;right:8px;top:calc(env(safe-area-inset-top,0px) + 8px);display:flex;gap:8px;flex-wrap:wrap;align-items:center;z-index:2}
+.bar button,.bar label{background:var(--panel);color:var(--fg);border:1px solid rgba(255,255,255,.3);border-radius:8px;padding:8px 12px;font-size:14px;cursor:pointer}
+#speed{margin-left:auto;background:var(--panel);padding:8px 12px;border-radius:8px;font-weight:700}
+.pad{position:fixed;bottom:calc(env(safe-area-inset-bottom,0px) + 16px);display:flex;gap:12px;z-index:2}
+#l{left:16px}#r{right:16px}
+.pad div{width:70px;height:70px;border-radius:50%;background:var(--panel);border:2px solid rgba(255,255,255,.4);display:flex;align-items:center;justify-content:center;font-size:26px;user-select:none;-webkit-user-select:none}
+#hint{position:fixed;left:0;right:0;bottom:calc(env(safe-area-inset-bottom,0px) + 8px);text-align:center;font-size:12px;opacity:.7;pointer-events:none}
+#net{background:var(--panel);padding:8px 12px;border-radius:8px;font-size:13px;display:none;cursor:pointer}
+#toast{position:fixed;top:30%;left:0;right:0;text-align:center;font-size:36px;font-weight:800;opacity:0;transition:opacity .3s;pointer-events:none;text-shadow:0 2px 6px #000}
+</style>
+</head>
+<body>
+<div class="bar">
+  <label>Load map (.glb)<input id="file" type="file" accept=".glb" hidden></label>
+  <button id="def">Oval track</button>
+  <button id="jump">Jump park</button>
+  <button id="sm">Map −</button><button id="sp">Map +</button>
+  <button id="rst">Reset (R)</button>
+  <button id="host">Host</button><button id="join">Join</button><button id="dc" hidden>Disconnect</button>
+  <div id="net"></div>
+  <div id="speed">0</div>
+</div>
+<div id="toast"></div>
+<div class="pad" id="l"><div data-k="left">◀</div><div data-k="right">▶</div></div>
+<div class="pad" id="r"><div data-k="hand" style="font-size:12px">DRIFT</div><div data-k="brake">▼</div><div data-k="gas">▲</div></div>
+<div id="hint">WASD / arrows to drive, Space to brake and drift, in the air W/S tilts the car, R to reset</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+scene.fog = new THREE.Fog(0x87ceeb, 80, 500);
+const cam = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 3000);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x446644, 0.9));
+const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+sun.position.set(50, 100, 30);
+scene.add(sun);
+
+// ---------- Physics constants and state ----------
+const G = 25;          // gravity (arcade-strength)
+const COM_H = 0.7;     // height of the car's center of mass above the ground
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const wrap = (a) => Math.atan2(Math.sin(a), Math.cos(a));
+let heading = 0, pitch = 0, roll = 0, pitchRate = 0, rollRate = 0; // pitch > 0 = nose down, roll > 0 = left side up
+let vy = 0, air = false, lastGy = 0, yawRate = 0;
+const vel = new THREE.Vector3(); // horizontal velocity only
+let mapType = 'oval';
+const start = { x: 38, z: 0 };
+
+// ---------- Map ----------
+const mapGroup = new THREE.Group();
+scene.add(mapGroup);
+let groundMeshes = [];
+let cones = [];
+const ray = new THREE.Raycaster();
+const DOWN = new THREE.Vector3(0, -1, 0);
+
+function clearMap() {
+  while (mapGroup.children.length) mapGroup.remove(mapGroup.children[0]);
+  mapGroup.scale.set(1, 1, 1);
+  groundMeshes = [];
+  cones = [];
+}
+function addGround(color) {
+  const g = new THREE.Mesh(new THREE.PlaneGeometry(2000, 2000), new THREE.MeshLambertMaterial({ color }));
+  g.rotation.x = -Math.PI / 2;
+  mapGroup.add(g);
+  groundMeshes.push(g);
+}
+function rayY(x, y, z) {
+  ray.set(new THREE.Vector3(x, y, z), DOWN);
+  const h = ray.intersectObjects(groundMeshes, false)[0];
+  return h ? h.point.y : null;
+}
+
+function buildDefault() {
+  clearMap();
+  mapType = 'oval';
+  start.x = 38; start.z = 0;
+  addGround(0x3a8a3a);
+  const road = new THREE.Mesh(new THREE.RingGeometry(30, 46, 96), new THREE.MeshLambertMaterial({ color: 0x444444, side: THREE.DoubleSide }));
+  road.rotation.x = -Math.PI / 2;
+  road.position.y = 0.03;
+  mapGroup.add(road);
+  const line = new THREE.Mesh(new THREE.RingGeometry(37.8, 38.2, 96), new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide }));
+  line.rotation.x = -Math.PI / 2;
+  line.position.y = 0.05;
+  mapGroup.add(line);
+  const coneGeo = new THREE.ConeGeometry(0.6, 1.4, 8);
+  const coneMat = new THREE.MeshLambertMaterial({ color: 0xff7a00 });
+  for (let i = 0; i < 64; i++) {
+    const a = (i / 64) * Math.PI * 2;
+    for (const rad of [29.5, 46.5]) {
+      const c = new THREE.Mesh(coneGeo, coneMat);
+      const hx = Math.cos(a) * rad, hz = Math.sin(a) * rad;
+      c.position.set(hx, 0.7, hz);
+      c.userData = { hx, hz, vx: 0, vz: 0, ang: 0, axis: null };
+      cones.push(c);
+      mapGroup.add(c);
+    }
+  }
+  resetCar();
+}
+
+function addRamp(x, z0, len, w, ang, yaw, color) {
+  const g = new THREE.Group();
+  g.position.set(x, 0, z0);
+  g.rotation.y = yaw;
+  const t = 1;
+  const slab = new THREE.Mesh(new THREE.BoxGeometry(w, t, len), new THREE.MeshLambertMaterial({ color }));
+  slab.rotation.x = -ang;
+  slab.position.set(0, (len / 2) * Math.sin(ang) - (t / 2) * Math.cos(ang), (len / 2) * Math.cos(ang));
+  g.add(slab);
+  mapGroup.add(g);
+  groundMeshes.push(slab);
+}
+
+function buildJump() {
+  clearMap();
+  mapType = 'jump';
+  start.x = 0; start.z = 0;
+  addGround(0x4a8f3a);
+  const road = new THREE.Mesh(new THREE.PlaneGeometry(16, 600), new THREE.MeshLambertMaterial({ color: 0x555555 }));
+  road.rotation.x = -Math.PI / 2;
+  road.position.set(0, 0.03, 250);
+  mapGroup.add(road);
+  // rolling humps (big cylinders buried in the ground)
+  for (const z of [60, 100, 140]) {
+    const g = new THREE.CylinderGeometry(40, 40, 40, 48);
+    g.rotateZ(Math.PI / 2);
+    const m = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ color: 0xc2a36b }));
+    m.position.set(0, -37, z);
+    mapGroup.add(m);
+    groundMeshes.push(m);
+  }
+  // ramps: small, medium, huge, plus an angled kicker off to the side
+  addRamp(0, 200, 14, 12, 0.22, 0, 0xff8c1a);
+  addRamp(0, 300, 20, 14, 0.30, 0, 0xff6a00);
+  addRamp(0, 420, 30, 16, 0.36, 0, 0xe63946);
+  addRamp(-45, 230, 16, 12, 0.28, 0.5, 0xffd166);
+  resetCar();
+}
+
+function loadGLB(buffer) {
+  new THREE.GLTFLoader().parse(buffer, '', (gltf) => {
+    clearMap();
+    mapType = 'glb';
+    start.x = 0; start.z = 0;
+    gltf.scene.traverse((o) => {
+      if (o.isMesh) {
+        const mats = Array.isArray(o.material) ? o.material : [o.material];
+        mats.forEach((m) => (m.side = THREE.DoubleSide));
+        groundMeshes.push(o);
+      }
+    });
+    mapGroup.add(gltf.scene);
+    resetCar();
+    sendMap();
+  }, (e) => alert('Could not load that file: ' + (e.message || e)));
+}
+
+// ---------- Car (origin is the center of mass, so it rotates around its middle) ----------
+const car = new THREE.Group();
+car.rotation.order = 'YXZ';
+const rig = new THREE.Group();
+rig.position.y = -COM_H;
+car.add(rig);
+const body = new THREE.Mesh(new THREE.BoxGeometry(2, 0.6, 4), new THREE.MeshLambertMaterial({ color: 0xd62828 }));
+body.position.y = 0.7;
+const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.5, 1.8), new THREE.MeshLambertMaterial({ color: 0x222a35 }));
+cabin.position.set(0, 1.25, -0.2);
+rig.add(body, cabin);
+const wheelGeo = new THREE.CylinderGeometry(0.4, 0.4, 0.3, 14);
+wheelGeo.rotateZ(Math.PI / 2);
+const wheelMat = new THREE.MeshLambertMaterial({ color: 0x111111 });
+for (const [x, z] of [[-1.05, 1.3], [1.05, 1.3], [-1.05, -1.3], [1.05, -1.3]]) {
+  const w = new THREE.Mesh(wheelGeo, wheelMat);
+  w.position.set(x, 0.4, z);
+  rig.add(w);
+}
+scene.add(car);
+const camPos = new THREE.Vector3();
+
+function resetCar() {
+  heading = 0; pitch = roll = pitchRate = rollRate = yawRate = 0;
+  vel.set(0, 0, 0); vy = 0; air = false;
+  const s = mapGroup.scale.x;
+  mapGroup.updateMatrixWorld(true);
+  const x = start.x * s, z = start.z * s;
+  const gy = rayY(x, 10000, z);
+  car.position.set(x, (gy === null ? 5 : gy) + COM_H, z);
+  lastGy = car.position.y;
+  car.rotation.set(0, 0, 0);
+  resetCones();
+  camPos.copy(car.position).add(new THREE.Vector3(0, 4, -9));
+}
+
+// ---------- Cones (lightweight custom physics) ----------
+function resetCones() {
+  cones.forEach((c) => {
+    c.position.set(c.userData.hx, 0.7, c.userData.hz);
+    c.quaternion.identity();
+    Object.assign(c.userData, { vx: 0, vz: 0, ang: 0, axis: null });
+  });
+}
+function updateCones(dt) {
+  if (!cones.length) return;
+  const s = mapGroup.scale.x;
+  const cx = car.position.x / s, cz = car.position.z / s;
+  const fx = Math.sin(heading), fz = Math.cos(heading);
+  const R = 1.1 / s + 0.6;
+  const carSpeed = vel.length() / s;
+  for (const c of cones) {
+    const u = c.userData;
+    for (const off of [1.4, 0, -1.4]) {
+      const px = cx + (fx * off) / s, pz = cz + (fz * off) / s;
+      let dx = c.position.x - px, dz = c.position.z - pz;
+      const d = Math.hypot(dx, dz);
+      if (d < R && d > 1e-6) {
+        dx /= d; dz /= d;
+        c.position.x = px + dx * R;
+        c.position.z = pz + dz * R;
+        const push = carSpeed * 1.2 + 2;
+        if (Math.hypot(u.vx, u.vz) < push) { u.vx = dx * push; u.vz = dz * push; }
+        if (!u.axis) u.axis = new THREE.Vector3(dz, 0, -dx);
+        vel.multiplyScalar(0.995);
+      }
+    }
+    c.position.x += u.vx * dt;
+    c.position.z += u.vz * dt;
+    const f = Math.exp(-2.5 * dt);
+    u.vx *= f; u.vz *= f;
+    if (u.axis) {
+      u.ang += (Math.PI / 2 - u.ang) * Math.min(1, 10 * dt);
+      c.quaternion.setFromAxisAngle(u.axis, u.ang);
+      c.position.y = 0.7 - 0.1 * (u.ang / (Math.PI / 2));
+    }
+  }
+}
+
+// ---------- Input ----------
+const keys = { gas: 0, brake: 0, left: 0, right: 0, hand: 0 };
+const keymap = { KeyW: 'gas', ArrowUp: 'gas', KeyS: 'brake', ArrowDown: 'brake', KeyA: 'left', ArrowLeft: 'left', KeyD: 'right', ArrowRight: 'right', Space: 'hand' };
+addEventListener('keydown', (e) => {
+  if (keymap[e.code]) { keys[keymap[e.code]] = 1; e.preventDefault(); }
+  if (e.code === 'KeyR') resetCar();
+});
+addEventListener('keyup', (e) => { if (keymap[e.code]) keys[keymap[e.code]] = 0; });
+document.querySelectorAll('.pad div').forEach((b) => {
+  const k = b.dataset.k;
+  b.addEventListener('pointerdown', (e) => { keys[k] = 1; e.preventDefault(); });
+  ['pointerup', 'pointerleave', 'pointercancel'].forEach((ev) => b.addEventListener(ev, () => (keys[k] = 0)));
+});
+document.getElementById('file').addEventListener('change', (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const fr = new FileReader();
+  fr.onload = () => loadGLB(fr.result);
+  fr.readAsArrayBuffer(f);
+  e.target.value = '';
+});
+document.getElementById('def').onclick = () => { buildDefault(); sendMap(); };
+document.getElementById('jump').onclick = () => { buildJump(); sendMap(); };
+document.getElementById('rst').onclick = resetCar;
+function rescale(k) { mapGroup.scale.multiplyScalar(k); resetCar(); }
+document.getElementById('sm').onclick = () => rescale(1 / 1.25);
+document.getElementById('sp').onclick = () => rescale(1.25);
+
+const toastEl = document.getElementById('toast');
+let toastT = 0;
+function toast(t) { toastEl.textContent = t; toastEl.style.opacity = 1; toastT = 1.2; }
+
+// ---------- Multiplayer (PeerJS, peer-to-peer) ----------
+const netEl = document.getElementById('net');
+let peer = null, conn = null, remote = null, rTarget = null, isHost = false, sendT = 0, roomCode = '';
+function setStatus(t) { netEl.textContent = t; netEl.style.display = t ? 'block' : 'none'; }
+function makeRemoteCar() {
+  const g = new THREE.Group();
+  g.rotation.order = 'YXZ';
+  const r = new THREE.Group();
+  r.position.y = -COM_H;
+  g.add(r);
+  const b = new THREE.Mesh(new THREE.BoxGeometry(2, 0.6, 4), new THREE.MeshLambertMaterial({ color: 0x1d6fd6 }));
+  b.position.y = 0.7;
+  const c = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.5, 1.8), new THREE.MeshLambertMaterial({ color: 0x222a35 }));
+  c.position.set(0, 1.25, -0.2);
+  r.add(b, c);
+  for (const [x, z] of [[-1.05, 1.3], [1.05, 1.3], [-1.05, -1.3], [1.05, -1.3]]) {
+    const w = new THREE.Mesh(wheelGeo, wheelMat);
+    w.position.set(x, 0.4, z);
+    r.add(w);
+  }
+  return g;
+}
+function removeRemote() { if (remote) scene.remove(remote); remote = null; rTarget = null; }
+function leave() {
+  try { if (conn) conn.close(); if (peer) peer.destroy(); } catch (e) {}
+  conn = null; peer = null;
+  removeRemote();
+  document.getElementById('dc').hidden = true;
+  setStatus('');
+}
+function sendMap() { if (conn && conn.open) conn.send({ t: 'map', m: mapType }); }
+function onData(d) {
+  if (d.t === 's') rTarget = d;
+  else if (d.t === 'map') {
+    if (d.m === 'oval') buildDefault();
+    else if (d.m === 'jump') buildJump();
+    else toast('Friend loaded a custom map, load the same .glb');
+  }
+}
+function hookConn(c) {
+  c.on('open', () => {
+    conn = c;
+    removeRemote();
+    remote = makeRemoteCar();
+    remote.visible = false;
+    scene.add(remote);
+    setStatus(isHost ? 'Friend connected' : 'Connected to room ' + roomCode);
+    if (isHost) sendMap();
+  });
+  c.on('data', onData);
+  c.on('close', () => {
+    removeRemote();
+    conn = null;
+    setStatus(isHost ? 'Friend left. Room ' + roomCode + ' is still open' : 'Disconnected');
+  });
+}
+function hostGame() {
+  leave();
+  isHost = true;
+  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  roomCode = Array.from({ length: 5 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+  peer = new Peer('minir-' + roomCode);
+  document.getElementById('dc').hidden = false;
+  setStatus('Starting room...');
+  peer.on('open', () => setStatus('Room ' + roomCode + ' (tap to copy invite link). Waiting for friend...'));
+  peer.on('connection', (c) => { if (conn) { c.close(); return; } hookConn(c); });
+  peer.on('error', (e) => { if (e.type === 'unavailable-id') hostGame(); else setStatus('Error: ' + e.type); });
+}
+function joinGame(code) {
+  leave();
+  isHost = false;
+  code = (code || '').trim().toUpperCase();
+  if (!code) return;
+  roomCode = code;
+  document.getElementById('dc').hidden = false;
+  setStatus('Joining ' + code + '...');
+  peer = new Peer();
+  peer.on('open', () => hookConn(peer.connect('minir-' + code)));
+  peer.on('error', (e) => setStatus(e.type === 'peer-unavailable' ? 'Room not found' : 'Error: ' + e.type));
+}
+document.getElementById('host').onclick = hostGame;
+document.getElementById('join').onclick = () => joinGame(prompt('Enter room code'));
+document.getElementById('dc').onclick = leave;
+netEl.onclick = () => {
+  if (!isHost || !roomCode) return;
+  const link = location.href.split('#')[0] + '#' + roomCode;
+  try { navigator.clipboard.writeText(link); toast('Link copied'); } catch (e) { prompt('Copy this link', link); }
+};
+
+// ---------- Loop ----------
+const speedEl = document.getElementById('speed');
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  mapGroup.updateMatrixWorld(true);
+
+  const throttle = keys.gas - keys.brake;
+  const steer = keys.left - keys.right;
+  const p = car.position;
+  const fwd = new THREE.Vector3(Math.sin(heading), 0, Math.cos(heading));
+  const lat = new THREE.Vector3(Math.cos(heading), 0, -Math.sin(heading));
+
+  // 1. Sample the ground under the four wheels
+  const offs = [[1.05, 1.3], [-1.05, 1.3], [1.05, -1.3], [-1.05, -1.3]];
+  const hs = offs.map(([a, b]) => rayY(p.x + lat.x * a + fwd.x * b, p.y + 3, p.z + lat.z * a + fwd.z * b));
+  const ok = hs.filter((h) => h !== null);
+  const hasGround = ok.length > 0;
+  let gy = 0, pitchG = 0, rollG = 0;
+  if (hasGround) {
+    const avg = ok.reduce((a, b) => a + b, 0) / ok.length;
+    const [fl, fr, rl, rr] = hs.map((h) => (h === null ? avg : h));
+    pitchG = Math.atan2((rl + rr) / 2 - (fl + fr) / 2, 2.6);
+    rollG = Math.atan2((fl + rl) / 2 - (fr + rr) / 2, 2.1);
+    gy = (fl + fr + rl + rr) / 4 + COM_H;
+  }
+
+  // 2. Horizontal motion (grip and driving only when on the ground)
+  let maxSpeed = 45;
+  if (mapType === 'oval') {
+    const d = Math.hypot(p.x, p.z) / mapGroup.scale.x;
+    if (d < 30 || d > 46) maxSpeed = 14;
+  }
+  if (!air) {
+    const h0 = heading;
+    let vf = vel.dot(fwd);
+    const mag = vel.length();
+    let turn = clamp(vf / 10, -1, 1);
+    if (keys.hand) turn = Math.min(1, mag / 10) * (vf < -1 ? -1 : 1);
+    heading += steer * (keys.hand ? 2.6 : 1.8) * dt * turn;
+    yawRate = (heading - h0) / dt; // remembered so a spin carries into the air
+    fwd.set(Math.sin(heading), 0, Math.cos(heading));
+    lat.set(Math.cos(heading), 0, -Math.sin(heading));
+    vf = vel.dot(fwd);
+    let vl = vel.dot(lat);
+    if (throttle !== 0) vf += throttle * (throttle * vf < 0 ? 50 : 28) * dt;
+    else vf -= Math.sign(vf) * Math.min(Math.abs(vf), 9 * dt);
+    if (keys.hand) vf -= Math.sign(vf) * Math.min(Math.abs(vf), 14 * dt);
+    vf += 9.8 * Math.sin(pitch) * 0.6 * dt; // hills speed you up or slow you down
+    if (Math.abs(vf) > maxSpeed) vf -= Math.sign(vf) * Math.min(Math.abs(vf) - maxSpeed, 40 * dt);
+    vf = Math.max(-15, vf);
+    vl *= Math.exp(-(keys.hand ? 1.5 : 10) * dt);
+    vel.set(0, 0, 0).addScaledVector(fwd, vf).addScaledVector(lat, vl);
+  } else {
+    yawRate = clamp(yawRate + steer * 2 * dt, -9, 9); // spin is kept in the air; steering only nudges it
+    heading += yawRate * dt;
+    vel.multiplyScalar(Math.exp(-0.05 * dt));
+    fwd.set(Math.sin(heading), 0, Math.cos(heading));
+  }
+  p.x += vel.x * dt;
+  p.z += vel.z * dt;
+  updateCones(dt);
+
+  // 3. Vertical motion: gravity, with the car following the ground while it is in contact
+  vy -= G * dt;
+  p.y += vy * dt;
+  if (hasGround && p.y <= gy) {
+    if (air) {
+      const bad = Math.max(Math.abs(wrap(pitch - pitchG)), Math.abs(wrap(roll - rollG)));
+      if (bad > 0.9) { vel.multiplyScalar(0.25); toast('WIPEOUT'); }
+      else vel.multiplyScalar(1 - Math.min(0.3, bad * 0.3));
+    }
+    vy = clamp((gy - lastGy) / dt, -25, 25); // ground rising under us = launch speed at a ramp lip
+    p.y = gy;
+    air = false;
+  } else {
+    air = true;
+  }
+  if (hasGround) lastGy = gy;
+  if (p.y < -500) resetCar();
+
+  // 4. Rotation around the center of mass
+  if (air) {
+    pitchRate += (keys.gas - keys.brake) * 3 * dt;                    // W = nose down, S = nose up
+    const target = Math.atan2(-vy, Math.hypot(vel.x, vel.z) + 1);     // nose gently follows the arc
+    pitchRate += (target - pitch) * 1.2 * dt;
+    pitchRate = clamp(pitchRate * Math.exp(-0.25 * dt), -4, 4);
+    rollRate *= Math.exp(-0.2 * dt);
+    pitch += pitchRate * dt;
+    roll += rollRate * dt;
+    // no flips: tilt is limited, and rotation stops at the limit
+    const LIM = 0.6;
+    if (Math.abs(pitch) > LIM) { pitch = Math.sign(pitch) * LIM; if (pitch * pitchRate > 0) pitchRate = 0; }
+    if (Math.abs(roll) > LIM) { roll = Math.sign(roll) * LIM; if (roll * rollRate > 0) rollRate = 0; }
+  } else {
+    pitch = wrap(pitch); roll = wrap(roll);
+    const k = 1 - Math.exp(-14 * dt);
+    const op = pitch, oroll = roll;
+    pitch += (pitchG - pitch) * k;
+    roll += (rollG - roll) * k;
+    pitchRate = clamp(((pitch - op) / dt) * 0.3, -3, 3);              // remembered for the next takeoff
+    rollRate = clamp(((roll - oroll) / dt) * 0.3, -3, 3);
+  }
+  car.rotation.set(pitch, heading, roll);
+
+  // Multiplayer: send our car, smooth the friend's car
+  const ns = mapGroup.scale.x;
+  if (conn && conn.open) {
+    sendT += dt;
+    if (sendT >= 1 / 30) {
+      sendT = 0;
+      conn.send({ t: 's', x: +(p.x / ns).toFixed(2), y: +(p.y / ns).toFixed(2), z: +(p.z / ns).toFixed(2), h: +heading.toFixed(3), p: +pitch.toFixed(3), r: +roll.toFixed(3) });
+    }
+  }
+  if (remote && rTarget) {
+    const k = 1 - Math.exp(-15 * dt);
+    if (!remote.visible) {
+      remote.visible = true;
+      remote.position.set(rTarget.x * ns, rTarget.y * ns, rTarget.z * ns);
+      remote.rotation.set(rTarget.p, rTarget.h, rTarget.r);
+    }
+    remote.position.x += (rTarget.x * ns - remote.position.x) * k;
+    remote.position.y += (rTarget.y * ns - remote.position.y) * k;
+    remote.position.z += (rTarget.z * ns - remote.position.z) * k;
+    remote.rotation.set(
+      remote.rotation.x + (rTarget.p - remote.rotation.x) * k,
+      remote.rotation.y + wrap(rTarget.h - remote.rotation.y) * k,
+      remote.rotation.z + (rTarget.r - remote.rotation.z) * k
+    );
+  }
+
+  // Camera
+  const target = p.clone().addScaledVector(fwd, -9).add(new THREE.Vector3(0, 4, 0));
+  camPos.lerp(target, 1 - Math.exp(-6 * dt));
+  cam.position.copy(camPos);
+  cam.lookAt(p.clone().addScaledVector(fwd, 5).add(new THREE.Vector3(0, 0.3, 0)));
+
+  speedEl.textContent = Math.round(vel.length() * 3) + ' km/h' + (air ? ' · AIR' : '');
+  if (toastT > 0) { toastT -= dt; if (toastT <= 0) toastEl.style.opacity = 0; }
+  renderer.render(scene, cam);
+  requestAnimationFrame(frame);
+}
+addEventListener('resize', () => {
+  cam.aspect = innerWidth / innerHeight;
+  cam.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+buildDefault();
+if (location.hash.length > 1) joinGame(location.hash.slice(1)); // invite links look like page.html#ABCDE
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
